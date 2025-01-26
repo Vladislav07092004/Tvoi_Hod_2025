@@ -1,7 +1,6 @@
 import sqlite3
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,6 +9,7 @@ from aiogram.filters import StateFilter
 import random
 import string
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.state import State, StatesGroup
 
 # Bot token
 BOT_TOKEN = "7235928823:AAHS3cfYTA3S9IlpdGub8284WPdg5shbTzE"
@@ -17,8 +17,8 @@ PREDEFINED_ADMIN_IDS = [1760175851]
 
 
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+storage = MemoryStorage()  # Хранилище состояний
+dp = Dispatcher(storage=storage)  # Подключение хранилища к Dispatcher
 
 def init_db():
     conn = sqlite3.connect("users.db")
@@ -46,7 +46,17 @@ def init_db():
         auth_method TEXT DEFAULT "Без пароля", -- По умолчанию "Без пароля"
         FOREIGN KEY (teacher_id) REFERENCES users (telegram_id)
     )''')
-    
+
+    # Таблица для задании
+    cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER,
+        task_text TEXT,
+        deadline TEXT,
+        FOREIGN KEY (group_id) REFERENCES groups (id)
+    )''')
+
+
     conn.commit()
     conn.close()
 
@@ -115,6 +125,7 @@ teacher_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Создать учебную группу")],
         [KeyboardButton(text="Мои учебные группы")],
+        [KeyboardButton(text="Добавить задание")],
         [KeyboardButton(text="Удалить учебную группу")],
         [KeyboardButton(text="Настройки группы")]
     ],
@@ -125,19 +136,9 @@ teacher_kb = ReplyKeyboardMarkup(
 settings_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Изменить максимальное количество участников")],
-        [KeyboardButton(text="Изменить способ аутентификации")],
         [KeyboardButton(text="Назад")]
     ],
     resize_keyboard=True
-)
-
-auth_method_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Пароль")],
-        [KeyboardButton(text="Без пароля")]
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True
 )
 
 
@@ -165,6 +166,10 @@ class GroupSettings(StatesGroup):
     update_max_members = State()
     update_auth_method = State()
 
+class AddTask(StatesGroup):
+    select_group = State()
+    input_task = State()
+    input_deadline = State()
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
@@ -428,7 +433,7 @@ async def group_description_step(message: types.Message, state: FSMContext):
     group_name = user_data.get("name")
     description = message.text
 
-    # Сохраняем группу в базу данных
+    # Сохраняем группу в базе данных без auth_method
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
     try:
@@ -437,14 +442,14 @@ async def group_description_step(message: types.Message, state: FSMContext):
             (group_name, description, message.from_user.id)
         )
         conn.commit()
-        await message.answer(f"Учебная группа '{group_name}' успешно создана!", reply_markup=teacher_kb)
+        await message.answer(f"Учебная группа '{group_name}' успешно создана!")
     except Exception as e:
         await message.answer(f"Ошибка при создании группы: {e}")
     finally:
         conn.close()
 
-    # Завершаем процесс
     await state.clear()
+
 
 @dp.message(lambda message: message.text == "Мои учебные группы")
 async def view_groups(message: types.Message):
@@ -452,20 +457,18 @@ async def view_groups(message: types.Message):
     cursor = conn.cursor()
 
     # Получаем группы, созданные преподавателем
-    cursor.execute("SELECT name, description, auth_method, max_members FROM groups WHERE teacher_id = ?", (message.from_user.id,))
+    cursor.execute("SELECT id, name, description FROM groups WHERE teacher_id = ?", (message.from_user.id,))
     groups = cursor.fetchall()
     conn.close()
 
     if groups:
+        # Отображаем список групп с их ID
         group_list = "\n\n".join([
-            f"Название: {g[0]}\nОписание: {g[1]}\nАутентификация: {'Пароль' if g[2] != 'Без пароля' else 'Без пароля'}{f' (Пароль: {g[2]})' if g[2] != 'Без пароля' else ''}\nМакс. участников: {g[3]}"
-            for g in groups
-        ])
+            f"Название: {g[0]}\nОписание: {g[1]}"
+            for g in groups])
         await message.answer(f"Ваши группы:\n\n{group_list}")
     else:
         await message.answer("У вас ещё нет созданных групп.")
-
-
 
 @dp.message(lambda message: message.text == "Создать учебную группу")
 async def create_group_prompt(message: types.Message, state: FSMContext):
@@ -548,66 +551,55 @@ async def group_settings_prompt(message: types.Message, state: FSMContext):
     cursor = conn.cursor()
 
     # Получаем группы преподавателя
-    cursor.execute("SELECT name FROM groups WHERE teacher_id = ?", (message.from_user.id,))
+    cursor.execute("SELECT id, name FROM groups WHERE teacher_id = ?", (message.from_user.id,))
     groups = cursor.fetchall()
     conn.close()
 
     if groups:
-        group_names = "\n".join([g[0] for g in groups])
+        # Отображаем список групп с их ID
+        group_list = "\n".join([f"ID: {g[0]} - {g[1]}" for g in groups])
         await message.answer(
-            f"Ваши группы:\n{group_names}\n\nВведите название группы, которую хотите настроить:"
+            f"Ваши группы:\n{group_list}\n\nВведите ID группы, которую хотите настроить:"
         )
         await state.set_state(GroupSettings.select_group)
     else:
         await message.answer("У вас нет созданных групп.")
 
+
 @dp.message(GroupSettings.select_group)
 async def select_group(message: types.Message, state: FSMContext):
-    group_name = message.text.strip()
+    try:
+        group_id = int(message.text.strip())  # Преобразуем введённый ID в число
 
-    conn = sqlite3.connect("users.db")
-    cursor = conn.cursor()
+        conn = sqlite3.connect("users.db")
+        cursor = conn.cursor()
 
-    # Сравниваем без учёта регистра
-    cursor.execute("""
-        SELECT id FROM groups 
-        WHERE LOWER(name) = LOWER(?) AND teacher_id = ?
-    """, (group_name.lower(), message.from_user.id))
-    group = cursor.fetchone()
-    conn.close()
+        # Проверяем, существует ли группа с таким ID у данного преподавателя
+        cursor.execute("SELECT id, name FROM groups WHERE id = ? AND teacher_id = ?", (group_id, message.from_user.id))
+        group = cursor.fetchone()
+        conn.close()
 
-    if group:
-        # Сохраняем данные группы в FSM
-        await state.update_data(group_id=group[0], group_name=group_name)
-        print(f"[DEBUG] Группа найдена и сохранена в FSM: {group_name} (ID = {group[0]})")
-
-        # Предлагаем выбрать действие и переключаем состояние
-        await message.answer("Что вы хотите изменить?", reply_markup=settings_kb)
-        await state.set_state(GroupSettings.update_max_members)  # Установим следующее состояние
-    else:
-        print("[DEBUG] Группа не найдена.")
-        await message.answer("Группа не найдена. Попробуйте снова. Введите корректное название группы:")
-
-
+        if group:
+            # Сохраняем данные группы в FSM
+            await state.update_data(group_id=group[0], group_name=group[1])
+            await message.answer(
+                f"Вы выбрали группу: {group[1]} (ID: {group[0]}). Что вы хотите изменить?",
+                reply_markup=settings_kb
+            )
+            await state.set_state(GroupSettings.select_action)
+        else:
+            await message.answer("Группа с таким ID не найдена. Убедитесь, что вы ввели корректный ID.")
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректный числовой ID.")
 
 @dp.message(lambda message: message.text == "Изменить максимальное количество участников")
 async def update_max_members_prompt(message: types.Message, state: FSMContext):
-    # Извлекаем данные из FSM
     user_data = await state.get_data()
     group_id = user_data.get("group_id")
     group_name = user_data.get("group_name")
 
-    # Логирование для проверки
-    print(f"[DEBUG] Данные из FSM: group_id={group_id}, group_name={group_name}")
-
-    if not group_id:
-        await message.answer("Ошибка: Сначала выберите группу. Попробуйте снова.")
-        return
-
-    # Переходим к вводу нового значения
-    await message.answer(f"Введите новое максимальное количество участников для группы '{group_name}':")
+    await message.answer(f"Введите новое максимальное количество участников для группы '{group_name}' (ID: {group_id}):")
     await state.set_state(GroupSettings.update_max_members)
-
 
 @dp.message(GroupSettings.update_max_members)
 async def update_max_members(message: types.Message, state: FSMContext):
@@ -616,32 +608,21 @@ async def update_max_members(message: types.Message, state: FSMContext):
         if max_members < 1:
             raise ValueError("Количество участников должно быть больше 0.")
 
-        # Извлекаем данные из FSM
         user_data = await state.get_data()
         group_id = user_data.get("group_id")
-        group_name = user_data.get("group_name")
 
-        # Логируем данные
-        print(f"[DEBUG] Изменение группы: group_id={group_id}, group_name={group_name}, max_members={max_members}")
-
-        if not group_id:
-            await message.answer("Ошибка: ID группы не найден. Попробуйте снова.")
-            return
-
-        # Обновляем данные в базе
         conn = sqlite3.connect("users.db")
         cursor = conn.cursor()
         cursor.execute("UPDATE groups SET max_members = ? WHERE id = ?", (max_members, group_id))
         conn.commit()
         conn.close()
 
-        await message.answer(f"Максимальное количество участников для группы '{group_name}' обновлено на {max_members}.", reply_markup=teacher_kb)
+        await message.answer(f"Максимальное количество участников для группы успешно обновлено на {max_members}.", reply_markup=teacher_kb)
         await state.clear()
     except ValueError:
         await message.answer("Введите корректное число.")
     except Exception as e:
-        print(f"[ERROR] {e}")
-        await message.answer("Произошла ошибка. Попробуйте снова.")
+        await message.answer(f"Произошла ошибка: {e}")
 
 
 @dp.message(CreateGroup.auth_method)
@@ -686,11 +667,11 @@ async def group_auth_method_step(message: types.Message, state: FSMContext):
     # Завершаем процесс
     await state.clear()
 
-
 @dp.message()
 async def debug_handler(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     print(f"[DEBUG] Получено сообщение: {message.text}, Состояние: {current_state}")
+
 
 @dp.message(lambda message: message.text in ["Преподаватель", "Ученик"])
 async def process_role_selection(message: types.Message, state: FSMContext):
@@ -698,6 +679,118 @@ async def process_role_selection(message: types.Message, state: FSMContext):
     await state.update_data(role=role)
     await message.answer(f"Вы выбрали роль: {role}. Теперь введите вашу фамилию.")
     await state.set_state(Registration.last_name)
+
+@dp.message(lambda message: message.text == "Добавить задание")
+async def add_task_start(message: types.Message, state: FSMContext):
+    print(f"[DEBUG] Текущее состояние до установки: {await state.get_state()}")  # Проверка начального состояния
+
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+
+    # Получаем группы преподавателя
+    cursor.execute("SELECT id, name FROM groups WHERE teacher_id = ?", (message.from_user.id,))
+    groups = cursor.fetchall()
+    conn.close()
+
+    if groups:
+        group_list = "\n".join([f"ID: {g[0]} - {g[1]}" for g in groups])
+        await message.answer(f"Ваши группы:\n{group_list}\n\nВведите ID группы, для которой хотите добавить задание:")
+        await state.set_state(AddTask.select_group)  # Устанавливаем состояние
+        print(f"[DEBUG] Состояние после установки: {await state.get_state()}")  # Проверка нового состояния
+    else:
+        await message.answer("У вас нет созданных групп.")
+
+@dp.message(lambda message: message.text == "Добавить задание")
+async def add_task_start(message: types.Message, state: FSMContext):
+    await state.clear()  # Сброс текущего состояния
+    await state.set_state(AddTask.select_group)  # Устанавливаем новое состояние
+    print(f"[DEBUG] Состояние после установки: {await state.get_state()}")
+
+@dp.message(AddTask.select_group)
+async def add_task_input_text(message: types.Message, state: FSMContext):
+    try:
+        group_id = int(message.text.strip())
+        conn = sqlite3.connect("users.db")
+        cursor = conn.cursor()
+        
+        # Проверяем, существует ли группа
+        cursor.execute("SELECT id FROM groups WHERE id = ? AND teacher_id = ?", (group_id, message.from_user.id))
+        group = cursor.fetchone()
+        conn.close()
+
+        if group:
+            await state.update_data(group_id=group_id)
+            await message.answer("Введите текст задания:")
+            await state.set_state(AddTask.input_task)
+        else:
+            await message.answer("Группа с таким ID не найдена. Попробуйте снова.")
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректный ID.")
+
+@dp.message(AddTask.input_task)
+async def add_task_input_deadline(message: types.Message, state: FSMContext):
+    task_text = message.text.strip()
+    await state.update_data(task_text=task_text)
+
+    await message.answer("Введите дедлайн для задания (в формате 'YYYY-MM-DD HH:MM'), или отправьте 'нет' для пропуска:")
+    await state.set_state(AddTask.input_deadline)
+
+@dp.message(AddTask.input_deadline)
+async def add_task_save(message: types.Message, state: FSMContext):
+    deadline = message.text.strip()
+    if deadline.lower() == "нет":
+        deadline = None  # Если пользователь не вводит дедлайн
+
+    user_data = await state.get_data()
+    group_id = user_data['group_id']
+    task_text = user_data['task_text']
+
+    # Сохраняем задание в базе данных
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO tasks (group_id, task_text, deadline) VALUES (?, ?, ?)",
+            (group_id, task_text, deadline)
+        )
+        conn.commit()
+        await message.answer(f"Задание успешно добавлено для группы с ID {group_id}.")
+    except Exception as e:
+        await message.answer(f"Произошла ошибка: {e}")
+    finally:
+        conn.close()
+
+    # Завершаем процесс
+    await state.clear()
+
+
+@dp.message(lambda message: message.text == "Просмотреть задания")
+async def view_tasks(message: types.Message):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+
+    # Получаем задания для групп преподавателя
+    cursor.execute("""
+        SELECT tasks.id, groups.name, tasks.task_text, tasks.deadline 
+        FROM tasks
+        JOIN groups ON tasks.group_id = groups.id
+        WHERE groups.teacher_id = ?
+    """, (message.from_user.id,))
+    tasks = cursor.fetchall()
+    conn.close()
+
+    if tasks:
+        task_list = "\n\n".join([
+            f"ID задания: {t[0]}\nГруппа: {t[1]}\nТекст задания: {t[2]}\nДедлайн: {t[3] or 'Без дедлайна'}"
+            for t in tasks
+        ])
+        await message.answer(f"Ваши задания:\n\n{task_list}")
+    else:
+        await message.answer("У вас нет заданий.")
+
+@dp.message()  # Общий обработчик должен быть последним
+async def fallback_handler(message: types.Message):
+    await message.answer("Я не понимаю это сообщение.")
 
 # Run bot
 async def main():
