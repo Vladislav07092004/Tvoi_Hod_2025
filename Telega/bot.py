@@ -493,16 +493,7 @@ async def group_name_step(message: types.Message, state: FSMContext):
     await message.answer("Введите описание группы:")
     await state.set_state(CreateGroup.description)
 
-@dp.message(CreateGroup.description)
-async def group_description_step(message: types.Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
 
-    # Показать клавиатуру для выбора способа аутентификации
-    await message.answer(
-        "Выберите способ аутентификации для группы:",
-        reply_markup=auth_method_kb
-    )
-    await state.set_state(CreateGroup.auth_method)
 
 
 
@@ -624,48 +615,6 @@ async def update_max_members(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"Произошла ошибка: {e}")
 
-
-@dp.message(CreateGroup.auth_method)
-async def group_auth_method_step(message: types.Message, state: FSMContext):
-    auth_method = message.text.strip()
-    if auth_method not in ["Пароль", "Без пароля"]:
-        await message.answer("Неверный выбор. Пожалуйста, выберите 'Пароль' или 'Без пароля'.", reply_markup=auth_method_kb)
-        return
-
-    # Генерация случайного пароля, если выбран метод "Пароль"
-    random_password = None
-    if auth_method == "Пароль":
-        random_password = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-
-    # Получаем данные группы из FSM
-    user_data = await state.get_data()
-    group_name = user_data.get("name")
-    description = user_data.get("description")
-
-    # Сохраняем данные группы в базу
-    conn = sqlite3.connect("users.db")
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO groups (name, description, teacher_id, auth_method, max_members) VALUES (?, ?, ?, ?, ?)",
-            (group_name, description, message.from_user.id, random_password or "Без пароля", 30)
-        )
-        conn.commit()
-
-        # Подтверждаем создание группы
-        await message.answer(
-            f"Группа '{group_name}' успешно создана!\n"
-            f"Описание: {description}\n"
-            f"Аутентификация: {'Пароль' if random_password else 'Без пароля'}"
-            f"{f' (Пароль: {random_password})' if random_password else ''}"
-        )
-    except Exception as e:
-        await message.answer(f"Ошибка при создании группы: {e}")
-    finally:
-        conn.close()
-
-    # Завершаем процесс
-    await state.clear()
 
 @dp.message()
 async def debug_handler(message: types.Message, state: FSMContext):
