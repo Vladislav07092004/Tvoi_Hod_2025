@@ -1,3 +1,2 @@
-zipfile
-os
-difflib
+aiogram==2.25.1
+sqlalchemy
