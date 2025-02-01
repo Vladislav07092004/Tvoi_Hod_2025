@@ -6,6 +6,7 @@ from aiogram.utils import executor
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, DateTime
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import datetime
 import logging
 import os
@@ -42,6 +43,9 @@ class Task(Base):
     name = Column(String)
     description = Column(Text)
     deadline = Column(DateTime)
+    input_data = Column(Text, nullable=True)
+    expected_result = Column(String, nullable=True)
+
 
 # Состояние для выбора группы
 class WatchGroup(StatesGroup):
@@ -59,11 +63,25 @@ dp = Dispatcher(bot, storage=storage)
 class CreateGroup(StatesGroup):
     waiting_for_group_name = State()
 
+""""
 class CreateTask(StatesGroup):
     waiting_for_group_id = State()
     waiting_for_task_name = State()
     waiting_for_task_description = State()
     waiting_for_task_deadline = State()
+    waiting_for_input_data = State()  # Новый шаг для ввода входных данных
+    waiting_for_expected_result = State()  # Новый шаг для ввода ожидаемого результата
+"""
+
+class CreateTask(StatesGroup):
+    waiting_for_group_id = State()
+    waiting_for_task_name = State()
+    waiting_for_task_description = State()
+    waiting_for_input_data = State()  # Исправлено имя состояния
+    waiting_for_expected_result = State()  # Исправлено имя состояния
+
+def get_back_button():
+    return ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад"))
 
 # Команда /start
 @dp.message_handler(commands=['start'])
@@ -140,44 +158,81 @@ async def create_task(message: types.Message):
 
 @dp.message_handler(state=CreateTask.waiting_for_group_id, content_types=types.ContentTypes.TEXT)
 async def set_task_group(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на начало.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад")))
+        await CreateTask.waiting_for_group_id.set()
+        return
     group_id = int(message.text)
     group = session.query(Group).filter_by(id=group_id).first()
     if not group:
         await message.reply("Группа с таким ID не найдена. Попробуйте ещё раз.")
         return
     await state.update_data(group_id=group_id)
-    await message.reply("Введите название задания:")
+    await message.reply("Введите название задания:", reply_markup=get_back_button())
     await CreateTask.waiting_for_task_name.set()
 
 @dp.message_handler(state=CreateTask.waiting_for_task_name, content_types=types.ContentTypes.TEXT)
 async def set_task_name(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг выбора группы.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_group_id.set()
+        return
     await state.update_data(task_name=message.text.strip())
-    await message.reply("Введите описание задания:")
+    await message.reply("Введите описание задания:", reply_markup=get_back_button())
     await CreateTask.waiting_for_task_description.set()
 
+""""
 @dp.message_handler(state=CreateTask.waiting_for_task_description, content_types=types.ContentTypes.TEXT)
 async def set_task_description(message: types.Message, state: FSMContext):
     await state.update_data(task_description=message.text.strip())
     await message.reply("Введите дедлайн задания в формате YYYY-MM-DD HH:MM:")
     await CreateTask.waiting_for_task_deadline.set()
+"""
 
-@dp.message_handler(state=CreateTask.waiting_for_task_deadline, content_types=types.ContentTypes.TEXT)
+@dp.message_handler(state=CreateTask.waiting_for_task_description, content_types=types.ContentTypes.TEXT)
+async def set_task_description(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг ввода названия задания.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_task_name.set()
+        return
+    await state.update_data(task_description=message.text.strip())
+    await message.reply("Введите входные данные для теста:", reply_markup=get_back_button())
+    await CreateTask.waiting_for_input_data.set()
+
+@dp.message_handler(state=CreateTask.waiting_for_input_data, content_types=types.ContentTypes.TEXT)
+async def set_task_input_data(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг ввода описания задания.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_task_description.set()
+        return
+    await state.update_data(input_data=message.text.strip())
+    await message.reply("Введите ожидаемый результат:", reply_markup=get_back_button())
+    await CreateTask.waiting_for_expected_result.set()
+
+@dp.message_handler(state=CreateTask.waiting_for_expected_result, content_types=types.ContentTypes.TEXT)
 async def save_task(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг ввода входных данных.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_input_data.set()
+        return
+
     try:
-        deadline = datetime.datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
         data = await state.get_data()
         task = Task(
             group_id=data["group_id"],
             name=data["task_name"],
             description=data["task_description"],
-            deadline=deadline
+            deadline=datetime.datetime.now(),  # или получайте дедлайн от пользователя
+            input_data=data["input_data"],
+            expected_result=data["expected_result"]
         )
         session.add(task)
         session.commit()
-        await message.reply(f"Задание '{task.name}' успешно создано.")
+        await message.reply(f"Задание '{task.name}' успешно создано.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад")))
         await state.finish()
     except ValueError:
-        await message.reply("Неверный формат даты. Попробуйте ещё раз (формат: YYYY-MM-DD HH:MM).")
+        await message.reply("Произошла ошибка при создании задания.")
+
 
 @dp.message_handler(commands=['help'])
 async def help_command(message: types.Message):
