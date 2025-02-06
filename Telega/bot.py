@@ -12,8 +12,9 @@ import logging
 import os
 
 
-logging.basicConfig()
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # Настройка базы данных SQLite
@@ -125,6 +126,7 @@ async def start_command(message: types.Message):
         await message.reply("Добро пожаловать! Выберите вашу роль:", reply_markup=markup)
 
 # Регистрация пользователя
+# Обработчик для регистрации пользователя (студент или преподаватель)
 @dp.message_handler(lambda message: message.text in ["Студент", "Преподаватель"])
 async def register_user(message: types.Message, state: FSMContext):
     role = "student" if message.text == "Студент" else "teacher"
@@ -136,6 +138,7 @@ async def register_user(message: types.Message, state: FSMContext):
     await state.set_state("waiting_for_full_name")  # Переход к состоянию для ввода Ф.И.О.
     
     await message.reply("Введите вашу фамилию и имя:" if role == "student" else "Введите вашу фамилию, имя и отчество:")
+
 
 # Обработчик для ввода Ф.И.О. для студентов и преподавателей
 @dp.message_handler(state="waiting_for_full_name", content_types=types.ContentTypes.TEXT)
@@ -175,17 +178,7 @@ async def save_region(message: types.Message, state: FSMContext):
         await state.set_state("waiting_for_city")
         await message.reply("Введите ваш город:")
 
-# Обработчик для ввода города (для студента)
-@dp.message_handler(state="waiting_for_city", content_types=types.ContentTypes.TEXT)
-async def save_city(message: types.Message, state: FSMContext):
-    city = message.text.strip()
-    await state.update_data(city=city)
-    
-    # Запрашиваем образовательную организацию
-    await state.set_state("waiting_for_educational_institution")
-    await message.reply("Введите образовательную организацию:")
-
-# Обработчик для ввода образовательной организации
+# Обработчик для ввода образовательной организации (для преподавателя или студента)
 @dp.message_handler(state="waiting_for_educational_institution", content_types=types.ContentTypes.TEXT)
 async def save_educational_institution(message: types.Message, state: FSMContext):
     educational_institution_name = message.text.strip()
@@ -208,22 +201,27 @@ async def save_educational_institution(message: types.Message, state: FSMContext
     # Логика для студента
     role = user_data.get('role')
     if role == "student":
-        # Шаг 2: Вывод преподавателей, работающих в выбранной организации
-        teachers = session.query(User).filter_by(educational_institution_id=institution.id, role="teacher").all()
-        if not teachers:
-            await message.reply(f"В образовательной организации {institution.name} нет преподавателей.")
-            return
-
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        for teacher in teachers:
-            keyboard.add(InlineKeyboardButton(teacher.full_name, callback_data=f"teacher_{teacher.id}"))
-
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Теперь выберите преподавателя по кнопке:", reply_markup=keyboard)
-        await state.set_state("waiting_for_teacher")
-    else:
-        # Логика для преподавателя
+        # Логика для студента
         await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Пожалуйста, используйте команду /create_group для добавления группы.")
         await state.finish()
+    else:
+        # Логика для преподавателя
+        # Сохраняем преподавателя в базе данных
+        user = User(
+            telegram_id=str(message.from_user.id),
+            full_name=user_data.get('full_name'),
+            role="teacher",  # Преподаватель
+            region=user_data.get('region'),
+            city=user_data.get('city'),
+            educational_institution_id=institution.id,  # Ссылка на образовательную организацию
+        )
+        session.add(user)
+        session.commit()  # Сохраняем преподавателя в базе данных
+
+        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Пожалуйста, используйте команду /create_group для добавления группы.")
+        await state.finish()
+
+
 
 # Шаг 3: Обработка выбора преподавателя (для студента)
 @dp.callback_query_handler(lambda c: c.data.startswith("teacher_"), state="waiting_for_teacher")
@@ -283,24 +281,48 @@ async def handle_group(message: types.Message, state: FSMContext):
 @dp.message_handler(commands=['create_group'])
 async def create_group(message: types.Message, state: FSMContext):
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
-    
+
     # Проверяем, является ли пользователь преподавателем
-    if user and user.role == "teacher":
-        # Логика для создания группы
-        await message.reply("Вы можете создать группу. Пожалуйста, введите имя группы.")
-        await state.set_state("waiting_for_group_name")  # Переход к следующему шагу
-    else:
+    if not user or user.role != "teacher":
         await message.reply("Эта команда доступна только для преподавателей.")
+        return
+
+    # Переход к процессу создания группы
+    await message.reply("Введите имя группы для создания.")
+    await state.set_state("waiting_for_group_name")  # Переход к следующему шагу для имени группы
 
 @dp.message_handler(state=CreateGroup.waiting_for_group_name, content_types=types.ContentTypes.TEXT)
 async def save_group_name(message: types.Message, state: FSMContext):
     group_name = message.text.strip()
-    password = os.urandom(4).hex()
-    group = Group(name=group_name, password=password)
-    session.add(group)
-    session.commit()
-    await message.reply(f"Группа '{group_name}' создана. Пароль для учеников: {password}")
-    await state.finish()
+
+    logger.info(f"Попытка создать группу с именем: {group_name}")
+
+    # Проверка на существование группы с таким названием
+    existing_group = session.query(Group).filter_by(name=group_name).first()
+    if existing_group:
+        logger.info(f"Группа с именем {group_name} уже существует.")
+        await message.reply("Группа с таким названием уже существует. Пожалуйста, выберите другое имя.")
+        return
+
+    password = os.urandom(4).hex()  # Генерация случайного пароля для группы
+    logger.info(f"Сгенерирован пароль для группы: {password}")
+
+    # Создание новой группы
+    new_group = Group(name=group_name, password=password)
+
+    # Добавляем группу в сессию и сохраняем её в базе данных
+    session.add(new_group)
+    try:
+        logger.info("Попытка сохранить группу в базе данных...")
+        session.commit()
+        logger.info(f"Группа '{group_name}' успешно сохранена с паролем {password}")
+        await message.reply(f"Группа '{group_name}' успешно создана. Пароль для учеников: {password}")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при сохранении группы: {e}")
+        await message.reply(f"Произошла ошибка при создании группы: {str(e)}")
+    finally:
+        await state.finish()  # Завершаем состояние
 
 # Присоединение ученика к группе
 @dp.message_handler(lambda message: not message.text.startswith("Группа: ") and len(message.text) == 8)
