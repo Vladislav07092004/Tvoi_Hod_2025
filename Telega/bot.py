@@ -48,8 +48,6 @@ class User(Base):
     educational_institution_id = Column(Integer, ForeignKey("educational_institutions.id"), nullable=True)
     educational_institution = relationship("EducationalInstitution")
 
-
-
 class Group(Base):
     __tablename__ = "groups"
     id = Column(Integer, primary_key=True, index=True)
@@ -190,6 +188,7 @@ async def save_region(message: types.Message, state: FSMContext):
         await message.reply("Введите ваш город:")
 
 # Обработчик для ввода образовательной организации (для преподавателя или студента)
+# Обработчик для ввода образовательной организации (для преподавателя или студента)
 @dp.message_handler(state="waiting_for_educational_institution", content_types=types.ContentTypes.TEXT)
 async def save_educational_institution(message: types.Message, state: FSMContext):
     educational_institution_name = message.text.strip()
@@ -212,12 +211,23 @@ async def save_educational_institution(message: types.Message, state: FSMContext
     # Логика для студента
     role = user_data.get('role')
     if role == "student":
-        # Логика для студента
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
+        # Сохраняем студента в базе данных
+        user = User(
+            telegram_id=str(message.from_user.id),
+            full_name=user_data.get('full_name'),
+            role="student",  # Студент
+            region=user_data.get('region'),
+            city=user_data.get('city'),
+            educational_institution_id=institution.id,  # Ссылка на образовательную организацию
+        )
+        session.add(user)
+        session.commit()  # Сохраняем студента в базе данных
+
+        # Завершаем регистрацию
+        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена! Пожалуйста, используйте команду /help для получения доступных вам команд.")
         await state.finish()
     else:
         # Логика для преподавателя
-        # Сохраняем преподавателя в базе данных
         user = User(
             telegram_id=str(message.from_user.id),
             full_name=user_data.get('full_name'),
@@ -229,10 +239,8 @@ async def save_educational_institution(message: types.Message, state: FSMContext
         session.add(user)
         session.commit()  # Сохраняем преподавателя в базе данных
 
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Пожалуйста, используйте команду /create_group для добавления группы.")
+        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена! Пожалуйста, используйте команду /help для получения доступных вам команд.")
         await state.finish()
-
-
 
 # Шаг 3: Обработка выбора преподавателя (для студента)
 @dp.callback_query_handler(lambda c: c.data.startswith("teacher_"), state="waiting_for_teacher")
@@ -439,8 +447,6 @@ async def cmd_view_passwords(message: types.Message, state: FSMContext):
         response += f"Группа: {group.name}, Пароль: {group.password}\n"
 
     await message.reply(response)
-
-
 
 # Присоединение ученика к группе
 @dp.message_handler(lambda message: not message.text.startswith("Группа: ") and len(message.text) == 8)
@@ -763,6 +769,83 @@ async def task_requirements(message: types.Message):
 
     requirements_list = "\n".join([f"{task.name}: {task.description}" for task in tasks])
     await message.reply(f"Требования к заданиям:\n{requirements_list}")
+
+@dp.message_handler(commands=['link_group'])
+async def link_group_command(message: types.Message):
+    # Проверяем, есть ли пользователь в базе данных
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user:
+        await message.reply("Вы не зарегистрированы в системе. Пожалуйста, сначала завершите регистрацию.")
+        return
+
+    # Запрашиваем ID группы
+    await message.reply("Введите ID группы, к которой вы хотите привязаться:")
+
+    # Переходим к следующему состоянию для ввода ID группы
+    await state.set_state("waiting_for_group_id")
+
+# Обработчик для ввода ID группы
+@dp.message_handler(state="waiting_for_group_id", content_types=types.ContentTypes.TEXT)
+async def save_group_id(message: types.Message, state: FSMContext):
+    group_id = message.text.strip()
+
+    # Проверяем, существует ли группа в базе данных
+    group = session.query(Group).filter_by(id=group_id).first()
+    if not group:
+        await message.reply("Группа с таким ID не найдена. Пожалуйста, убедитесь, что ID введен корректно.")
+        return
+
+    # Если группа защищена паролем, запрашиваем пароль
+    if group.password:
+        await message.reply("Эта группа защищена паролем. Пожалуйста, введите пароль:")
+
+        # Переходим к состоянию для ввода пароля
+        await state.set_state("waiting_for_group_password")
+        # Сохраняем ID группы в состоянии для дальнейшего использования
+        await state.update_data(group_id=group.id)
+        return
+
+    # Если пароль не нужен, сразу привязываем пользователя к группе
+    user_data = await state.get_data()
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    # Привязываем пользователя к группе
+    user.group_id = group.id
+    session.commit()
+
+    # Завершаем процесс
+    await message.reply(f"Вы успешно привязаны к группе {group.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
+    await state.finish()
+
+# Обработчик для ввода пароля группы
+@dp.message_handler(state="waiting_for_group_password", content_types=types.ContentTypes.TEXT)
+async def verify_group_password(message: types.Message, state: FSMContext):
+    entered_password = message.text.strip()
+
+    # Получаем данные о группе из состояния
+    user_data = await state.get_data()
+    group_id = user_data.get('group_id')
+
+    # Ищем группу в базе данных по ID
+    group = session.query(Group).filter_by(id=group_id).first()
+    if not group:
+        await message.reply("Ошибка! Группа не найдена.")
+        await state.finish()
+        return
+
+    # Проверяем, совпадает ли введенный пароль с паролем группы
+    if group.password != entered_password:
+        await message.reply("Неверный пароль! Попробуйте снова.")
+        return
+
+    # Привязываем пользователя к группе, если пароль верный
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    user.group_id = group.id
+    session.commit()
+
+    # Завершаем процесс
+    await message.reply(f"Вы успешно привязаны к группе {group.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
+    await state.finish()
 
 # Запуск бота
 if __name__ == "__main__":
