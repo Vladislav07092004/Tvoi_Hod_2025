@@ -53,6 +53,8 @@ class Group(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True)
     password = Column(String)
+    teacher_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Сделано nullable=True
+
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -77,6 +79,10 @@ API_TOKEN = "7235928823:AAHS3cfYTA3S9IlpdGub8284WPdg5shbTzE"
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+
+class Form(StatesGroup):
+    waiting_for_group_id = State()
+
 
 class CreateGroup(StatesGroup):
     waiting_for_group_name = State()
@@ -311,6 +317,7 @@ async def cmd_create_group(message: types.Message, state: FSMContext):
     await message.reply("Введите название новой группы:")
 
 # Обработчик для ввода названия группы
+# Обработчик для ввода названия группы
 @dp.message_handler(state="waiting_for_group_name", content_types=types.ContentTypes.TEXT)
 async def process_group_name(message: types.Message, state: FSMContext):
     group_name = message.text.strip()
@@ -320,12 +327,29 @@ async def process_group_name(message: types.Message, state: FSMContext):
         await message.reply("Название группы не может быть пустым. Попробуйте снова.")
         return
 
-    # Переход к состоянию для выбора пароля
+    # Получаем данные о преподавателе (например, текущий пользователь)
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    # Проверка, что пользователь является преподавателем
+    if not user or user.role != "teacher":
+        await message.reply("Только преподаватели могут создавать группы.")
+        return
+
+    # Сохраняем название группы в состоянии
     await state.update_data(group_name=group_name)  # Сохраняем название группы
-    await state.set_state("waiting_for_password_choice")
-    await message.reply("Хотите установить пароль для группы? Введите 'да' для установки пароля или 'нет' для создания группы без пароля.")
+    
+    # Создаем группу с привязкой к преподавателю
+    new_group = Group(name=group_name, password=None, teacher_id=user.id)
+    session.add(new_group)
+    session.commit()
+    await message.reply(f"Группа '{group_name}' успешно создана без пароля.")
+
+    # Завершаем процесс создания группы
+    await state.finish()
+
 
 # Обработчик для выбора пароля
+"""
 @dp.message_handler(state="waiting_for_password_choice", content_types=types.ContentTypes.TEXT)
 async def process_password_choice(message: types.Message, state: FSMContext):
     password_choice = message.text.strip().lower()
@@ -346,8 +370,8 @@ async def process_password_choice(message: types.Message, state: FSMContext):
         # Если с паролем, просим задать пароль или генерируем его
         await state.set_state("waiting_for_password")
         await message.reply(f"Введите пароль для группы '{group_name}' или отправьте 'генерировать' для автоматического пароля.")
+"""
 
-# Обработчик для ввода пароля
 # Обработчик для ввода пароля
 @dp.message_handler(state="waiting_for_password", content_types=types.ContentTypes.TEXT)
 async def process_password(message: types.Message, state: FSMContext):
@@ -432,6 +456,7 @@ async def process_new_password(message: types.Message, state: FSMContext):
     await state.finish()
 
 # Обработчик для просмотра паролей (только для преподавателя или администратора)
+"""
 @dp.message_handler(commands=['view_passwords'])
 async def cmd_view_passwords(message: types.Message, state: FSMContext):
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
@@ -447,6 +472,7 @@ async def cmd_view_passwords(message: types.Message, state: FSMContext):
         response += f"Группа: {group.name}, Пароль: {group.password}\n"
 
     await message.reply(response)
+"""
 
 # Присоединение ученика к группе
 @dp.message_handler(lambda message: not message.text.startswith("Группа: ") and len(message.text) == 8)
@@ -455,13 +481,14 @@ async def join_group(message: types.Message):
     if not user or user.role != "student":
         await message.reply("Эта команда доступна только для студентов.")
         return
-    group = session.query(Group).filter_by(password=message.text).first()
+    group = session.query(Group).filter_by(password=None).first()  # Ищем группу без пароля
     if group:
         user.group_id = group.id
         session.commit()
         await message.reply(f"Вы присоединились к группе '{group.name}'.")
     else:
-        await message.reply("Неверный пароль группы.")
+        await message.reply("Группа с таким паролем не найдена.")
+
 
 # Создание задания
 @dp.message_handler(commands=['create_task'])
@@ -782,7 +809,25 @@ async def link_group_command(message: types.Message):
     await message.reply("Введите ID группы, к которой вы хотите привязаться:")
 
     # Переходим к следующему состоянию для ввода ID группы
-    await state.set_state("waiting_for_group_id")
+    await Form.waiting_for_group_id.set()
+
+@dp.message_handler(state=Form.waiting_for_group_id)
+async def process_group_id(message: types.Message, state: FSMContext):
+    group_id = message.text.strip()
+
+    # Проверка на корректность введенного ID
+    if not group_id.isdigit():
+        await message.reply("Пожалуйста, введите корректный ID группы.")
+        return
+
+    # Запись в базу данных или другие действия с group_id
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    user.group_id = group_id
+    session.commit()
+
+    await message.reply(f"Вы успешно привязались к группе с ID: {group_id}")
+    await state.finish()
+
 
 # Обработчик для ввода ID группы
 @dp.message_handler(state="waiting_for_group_id", content_types=types.ContentTypes.TEXT)
@@ -795,17 +840,7 @@ async def save_group_id(message: types.Message, state: FSMContext):
         await message.reply("Группа с таким ID не найдена. Пожалуйста, убедитесь, что ID введен корректно.")
         return
 
-    # Если группа защищена паролем, запрашиваем пароль
-    if group.password:
-        await message.reply("Эта группа защищена паролем. Пожалуйста, введите пароль:")
-
-        # Переходим к состоянию для ввода пароля
-        await state.set_state("waiting_for_group_password")
-        # Сохраняем ID группы в состоянии для дальнейшего использования
-        await state.update_data(group_id=group.id)
-        return
-
-    # Если пароль не нужен, сразу привязываем пользователя к группе
+    # Привязываем пользователя к группе без запроса пароля
     user_data = await state.get_data()
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
 
@@ -817,11 +852,10 @@ async def save_group_id(message: types.Message, state: FSMContext):
     await message.reply(f"Вы успешно привязаны к группе {group.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
     await state.finish()
 
+
 # Обработчик для ввода пароля группы
 @dp.message_handler(state="waiting_for_group_password", content_types=types.ContentTypes.TEXT)
 async def verify_group_password(message: types.Message, state: FSMContext):
-    entered_password = message.text.strip()
-
     # Получаем данные о группе из состояния
     user_data = await state.get_data()
     group_id = user_data.get('group_id')
@@ -833,19 +867,19 @@ async def verify_group_password(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    # Проверяем, совпадает ли введенный пароль с паролем группы
-    if group.password != entered_password:
-        await message.reply("Неверный пароль! Попробуйте снова.")
-        return
-
-    # Привязываем пользователя к группе, если пароль верный
+    # Привязываем пользователя к группе
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
-    user.group_id = group.id
-    session.commit()
+    if user:
+        user.group_id = group.id
+        session.commit()
 
-    # Завершаем процесс
-    await message.reply(f"Вы успешно привязаны к группе {group.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
-    await state.finish()
+        # Завершаем процесс
+        await message.reply(f"Вы успешно привязаны к группе {group.name}. Пожалуйста, используйте команду /help для получения доступных вам команд.")
+        await state.finish()
+    else:
+        await message.reply("Ошибка: Не удалось найти пользователя. Попробуйте снова.")
+        await state.finish()
+
 
 # Запуск бота
 if __name__ == "__main__":
