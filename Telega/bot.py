@@ -66,6 +66,18 @@ class Task(Base):
     input_data = Column(Text, nullable=True)
     expected_result = Column(String, nullable=True)
 
+class SupportRequest(Base):
+    __tablename__ = "support_requests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    assigned_support_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Кто отвечает за запрос
+    message = Column(Text)
+    response = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="open")  # open, in_progress, closed
+
+    user = relationship("User", foreign_keys=[user_id])
+    assigned_support = relationship("User", foreign_keys=[assigned_support_id])
 
 # Состояние для выбора группы
 class WatchGroup(StatesGroup):
@@ -75,7 +87,7 @@ class WatchGroup(StatesGroup):
 Base.metadata.create_all(bind=engine)
 
 # Настройка Telegram-бота
-API_TOKEN = "7235928823:AAHS3cfYTA3S9IlpdGub8284WPdg5shbTzE"
+API_TOKEN = "7202246841:AAHFaSOPlpIJTRjzSKx-HEVXt65axfJPz_Q"
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -130,8 +142,10 @@ def escape_markdown(text: str) -> str:
     return re.sub(r'([\\_*[\]()>#+-.!|])', r'\\\1', text)
 
 # Команда /start
-@dp.message_handler(commands=['start'])
-async def start_command(message: types.Message):
+@dp.message_handler(commands=['start'], state="*")
+async def start_command(message: types.Message, state: FSMContext):
+    await state.finish()  # Завершаем текущее состояние пользователя, если оно есть
+
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
     if user:
         await message.reply(f"Вы уже зарегистрированы как {user.role}.")
@@ -194,7 +208,6 @@ async def save_region(message: types.Message, state: FSMContext):
         await message.reply("Введите ваш город:")
 
 # Обработчик для ввода образовательной организации (для преподавателя или студента)
-# Обработчик для ввода образовательной организации (для преподавателя или студента)
 @dp.message_handler(state="waiting_for_educational_institution", content_types=types.ContentTypes.TEXT)
 async def save_educational_institution(message: types.Message, state: FSMContext):
     educational_institution_name = message.text.strip()
@@ -211,8 +224,15 @@ async def save_educational_institution(message: types.Message, state: FSMContext
         session.add(institution)
         session.commit()  # Сохраняем образовательную организацию в базе данных
 
-    # Сохраняем ID образовательной организации в данных
-    await state.update_data(educational_institution_id=institution.id)
+    # Проверяем, существует ли уже пользователь с таким ФИО в той же организации
+    existing_user = session.query(User).filter_by(
+        full_name=user_data.get('full_name'),
+        educational_institution_id=institution.id
+    ).first()
+
+    if existing_user:
+        await message.reply("Ошибка: Пользователь с таким ФИО уже зарегистрирован в этой образовательной организации.")
+        return
 
     # Логика для студента
     role = user_data.get('role')
@@ -221,32 +241,32 @@ async def save_educational_institution(message: types.Message, state: FSMContext
         user = User(
             telegram_id=str(message.from_user.id),
             full_name=user_data.get('full_name'),
-            role="student",  # Студент
+            role="student",
             region=user_data.get('region'),
             city=user_data.get('city'),
-            educational_institution_id=institution.id,  # Ссылка на образовательную организацию
+            educational_institution_id=institution.id,  
         )
         session.add(user)
-        session.commit()  # Сохраняем студента в базе данных
+        session.commit()  
 
-        # Завершаем регистрацию
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена! Пожалуйста, используйте команду /help для получения доступных вам команд.")
+        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена!")
         await state.finish()
     else:
         # Логика для преподавателя
         user = User(
             telegram_id=str(message.from_user.id),
             full_name=user_data.get('full_name'),
-            role="teacher",  # Преподаватель
+            role="teacher",
             region=user_data.get('region'),
             city=user_data.get('city'),
-            educational_institution_id=institution.id,  # Ссылка на образовательную организацию
+            educational_institution_id=institution.id,  
         )
         session.add(user)
-        session.commit()  # Сохраняем преподавателя в базе данных
+        session.commit()
 
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена! Пожалуйста, используйте команду /help для получения доступных вам команд.")
+        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена!")
         await state.finish()
+
 
 # Шаг 3: Обработка выбора преподавателя (для студента)
 @dp.callback_query_handler(lambda c: c.data.startswith("teacher_"), state="waiting_for_teacher")
@@ -602,8 +622,8 @@ async def save_task(message: types.Message, state: FSMContext):
         await message.reply("Произошла ошибка при создании задания.")
 
 
-@dp.message_handler(commands=['help'])
-async def help_command(message: types.Message):
+@dp.message_handler(commands=['help'], state="*")
+async def help_command(message: types.Message, state: FSMContext):
     help_text = """
 📚 **Список доступных команд:**
 
@@ -628,6 +648,57 @@ async def help_command(message: types.Message):
 
 💡 Если у вас возникли вопросы или проблемы, обратитесь к администратору.
     """
+    await message.reply(help_text, parse_mode="Markdown")
+
+    # Проверяем, есть ли активное состояние у пользователя
+    current_state = await state.get_state()
+    if current_state:
+        await message.reply("Вы можете продолжить с того места, где остановились. Просто продолжите ввод.")
+
+@dp.message_handler(commands=['help_admin'])
+async def help_admin_command(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для использования этой команды.")
+        return
+
+    help_text = """
+🛠 **Панель техподдержки** 🛠
+
+👥 **Управление пользователями:**
+- `/list_users` — показать всех пользователей.
+- `/find_user <ID | имя>` — найти пользователя.
+- `/edit_user <ID> <student/teacher/support>` — изменить роль пользователя.
+- `/delete_user <ID>` — удалить пользователя.
+
+🏫 **Управление группами:**
+- `/list_groups` — показать все группы.
+- `/reset_group_password <ID группы>` — сброс пароля группы.
+
+📩 **Запросы в поддержку:**
+- `/list_open_requests` — список всех открытых запросов.
+- `/take_request <ID>` — взять запрос в работу.
+- `/transfer_request <ID> <@username>` — передать запрос другому специалисту.
+- `/my_requests_admin` — список запросов, назначенных на вас.
+- `/reply_request <ID> <ответ>` — ответить пользователю на запрос.
+
+📊 **Отчёты и статистика:**
+- `/support_report` — общий отчёт по пользователям, группам и активности.
+
+⚙️ **Дополнительно:**
+- `/help_admin` — показать этот список команд.
+
+💡 **Как работать с запросами?**
+1️⃣ Запросы пользователей видны в `/list_open_requests`.  
+2️⃣ Чтобы взять запрос себе, используйте `/take_request <ID>`.  
+3️⃣ Если не можете ответить, передайте запрос через `/transfer_request <ID> <@username>`.  
+4️⃣ Чтобы ответить пользователю, используйте `/reply_request <ID> <ответ>`.  
+5️⃣ Просмотреть свои активные запросы — `/my_requests_admin`.  
+6️⃣ Получить статистику по системе — `/support_report`.  
+
+📌 **Если у вас возникли вопросы, обратитесь к главному администратору.**
+"""
     await message.reply(help_text, parse_mode="Markdown")
 
 # Обработчик команды /watchgroup
@@ -880,6 +951,261 @@ async def verify_group_password(message: types.Message, state: FSMContext):
         await message.reply("Ошибка: Не удалось найти пользователя. Попробуйте снова.")
         await state.finish()
 
+@dp.message_handler(commands=['list_users'])
+async def list_users(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для просмотра пользователей.")
+        return
+
+    users = session.query(User).all()
+    user_list = "\n".join([f"{u.id}: {u.full_name} ({u.role})" for u in users])
+    await message.reply(f"👥 **Список пользователей:**\n{user_list}", parse_mode="Markdown")
+
+@dp.message_handler(commands=['find_user'])
+async def find_user(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для поиска пользователей.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("📌 Использование: `/find_user <ID или имя>`", parse_mode="Markdown")
+        return
+
+    search_term = args[1]
+    found_users = session.query(User).filter(User.full_name.ilike(f"%{search_term}%")).all()
+
+    if not found_users:
+        await message.reply("🔍 Пользователь не найден.")
+        return
+
+    user_info = "\n".join([f"{u.id}: {u.full_name} ({u.role})" for u in found_users])
+    await message.reply(f"🔎 **Найденные пользователи:**\n{user_info}", parse_mode="Markdown")
+
+@dp.message_handler(commands=['edit_user'])
+async def edit_user(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для редактирования пользователей.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply("📌 Использование: `/edit_user <ID> <новая роль>`", parse_mode="Markdown")
+        return
+
+    user_id, new_role = args[1], args[2]
+    target_user = session.query(User).filter_by(id=user_id).first()
+
+    if not target_user:
+        await message.reply("🔍 Пользователь не найден.")
+        return
+
+    if new_role not in ["student", "teacher", "support"]:
+        await message.reply("⚠️ Роль должна быть: `student`, `teacher` или `support`", parse_mode="Markdown")
+        return
+
+    target_user.role = new_role
+    session.commit()
+    await message.reply(f"✅ Пользователь `{target_user.full_name}` теперь `{new_role}`.", parse_mode="Markdown")
+
+@dp.message_handler(commands=['list_groups'])
+async def list_groups(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для просмотра групп.")
+        return
+
+    groups = session.query(Group).all()
+    group_list = "\n".join([f"{g.id}: {g.name}" for g in groups])
+    await message.reply(f"🏫 **Список групп:**\n{group_list}", parse_mode="Markdown")
+
+@dp.message_handler(commands=['support_request'])
+async def send_support_request(message: types.Message):
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    if not user:
+        await message.reply("❌ Вы не зарегистрированы в системе.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("📌 Использование: `/support_request <ваш вопрос>`")
+        return
+
+    user_message = args[1]
+
+    support_request = SupportRequest(
+        user_id=user.id,
+        message=user_message,
+        status="open"
+    )
+    session.add(support_request)
+    session.commit()
+
+    await message.reply("✅ Ваш запрос отправлен в техподдержку. Ожидайте ответа.")
+
+    support_users = session.query(User).filter_by(role="support").all()
+    for support in support_users:
+        await bot.send_message(support.telegram_id, f"📩 Новый запрос: {user.full_name}:\n{user_message}\nОтвет: `/reply_request {support_request.id} <ответ>`")
+
+@dp.message_handler(commands=['reply_request'])
+async def reply_to_support_request(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для ответа на запросы.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply("📌 Использование: `/reply_request <ID запроса> <ответ>`")
+        return
+
+    request_id, response_text = args[1], args[2]
+    support_request = session.query(SupportRequest).filter_by(id=request_id, status="open").first()
+
+    if not support_request:
+        await message.reply("❌ Запрос не найден или уже закрыт.")
+        return
+
+    support_request.response = response_text
+    support_request.support_id = support.id
+    support_request.status = "closed"
+    session.commit()
+
+    user = session.query(User).filter_by(id=support_request.user_id).first()
+    if user:
+        await bot.send_message(user.telegram_id, f"📩 Ответ техподдержки:\n❓ {support_request.message}\n✅ {response_text}")
+
+    await message.reply(f"✅ Ответ отправлен пользователю {user.full_name}.")
+
+@dp.message_handler(commands=['list_open_requests'])
+async def list_open_requests(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для просмотра запросов.")
+        return
+
+    requests = session.query(SupportRequest).filter_by(status="open").all()
+
+    if not requests:
+        await message.reply("📌 Нет открытых запросов в поддержку.")
+        return
+
+    request_list = "\n".join(
+        [f"🆔 **ID:** {r.id} | 👤 **{r.user.full_name}** | ❓ {r.message}" for r in requests]
+    )
+    
+    await message.reply(f"📋 **Открытые запросы:**\n\n{request_list}\n\nОтветить: `/reply_request <ID запроса> <ответ>`", parse_mode="Markdown")
+
+@dp.message_handler(commands=['take_request'])
+async def take_request(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для работы с запросами.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("📌 Использование: `/take_request <ID запроса>`")
+        return
+
+    request_id = args[1]
+    support_request = session.query(SupportRequest).filter_by(id=request_id, status="open").first()
+
+    if not support_request:
+        await message.reply("❌ Запрос не найден или уже обрабатывается.")
+        return
+
+    support_request.assigned_support_id = support.id
+    support_request.status = "in_progress"
+    session.commit()
+
+    await message.reply(f"✅ Запрос `{request_id}` теперь в вашей зоне ответственности.", parse_mode="Markdown")
+
+@dp.message_handler(commands=['transfer_request'])
+async def transfer_request(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для передачи запросов.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply("📌 Использование: `/transfer_request <ID запроса> <@username>`")
+        return
+
+    request_id, new_support_username = args[1], args[2].replace("@", "")
+
+    # Ищем специалиста по username
+    new_support = session.query(User).filter_by(full_name=new_support_username, role="support").first()
+    support_request = session.query(SupportRequest).filter_by(id=request_id, assigned_support_id=support.id).first()
+
+    if not support_request:
+        await message.reply("❌ Запрос не найден или не назначен вам.")
+        return
+
+    if not new_support:
+        await message.reply("❌ Специалист техподдержки с таким именем не найден.")
+        return
+
+    support_request.assigned_support_id = new_support.id
+    session.commit()
+
+    await message.reply(f"✅ Запрос `{request_id}` передан специалисту **{new_support.full_name}**.", parse_mode="Markdown")
+    await bot.send_message(new_support.telegram_id, f"🔄 Вам передан запрос `{request_id}` от **{support.full_name}**.")
+
+@dp.message_handler(commands=['my_requests_admin'])
+async def my_requests_admin(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для просмотра запросов.")
+        return
+
+    # Получаем все запросы, назначенные на данного специалиста и не закрытые
+    requests = session.query(SupportRequest).filter(
+        SupportRequest.assigned_support_id == support.id,
+        SupportRequest.status.in_(["open", "in_progress"])
+    ).all()
+
+    if not requests:
+        await message.reply("📌 У вас нет активных запросов.")
+        return
+
+    request_list = "\n\n".join([
+        f"🆔 **ID:** {r.id}\n👤 **Пользователь:** {r.user.full_name}\n❓ **Запрос:** {r.message}\n📅 **Дата:** {r.created_at.strftime('%Y-%m-%d %H:%M')}\n📌 **Статус:** {r.status.upper()}"
+        for r in requests
+    ])
+
+    await message.reply(f"📋 **Ваши активные запросы:**\n\n{request_list}", parse_mode="Markdown")
+
+
+@dp.message_handler(commands=['list_open_requests'])
+async def list_open_requests(message: types.Message):
+    support = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+
+    if not support or support.role != "support":
+        await message.reply("❌ У вас нет прав для просмотра запросов.")
+        return
+
+    requests = session.query(SupportRequest).filter(SupportRequest.status.in_(["open", "in_progress"])).all()
+
+    if not requests:
+        await message.reply("📌 Нет открытых запросов.")
+        return
+
+    request_list = "\n".join(
+        [f"🆔 **ID:** {r.id} | 👤 {r.user.full_name} | ❓ {r.message} | 🛠 {r.assigned_support.full_name if r.assigned_support else '❌ Не назначен'}"
+         for r in requests]
+    )
+    
+    await message.reply(f"📋 **Открытые запросы:**\n\n{request_list}\n\nВзять запрос: `/take_request <ID>`", parse_mode="Markdown")
 
 # Запуск бота
 if __name__ == "__main__":
