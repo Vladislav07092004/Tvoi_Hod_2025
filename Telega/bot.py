@@ -9,17 +9,19 @@ from sqlalchemy.orm import sessionmaker
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.types import ParseMode
 from datetime import datetime
+from aiogram.types import ContentType
 import logging
 import os
 import random
 import string
 import re
-
+import hashlib
+import zipfile
+import io
 
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 # Настройка базы данных SQLite
 DATABASE_URL = "sqlite:///database.db"
@@ -93,30 +95,29 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 class Form(StatesGroup):
-    waiting_for_group_id = State()
-
+    waiting_for_full_name = State()
+    waiting_for_region = State()
+    waiting_for_city = State()
+    waiting_for_educational_institution = State()
+    waiting_for_teacher_confirmation = State()  # Новое состояние для подтверждения
+    waiting_for_group_id = State()  # Добавляем новое состояние
 
 class CreateGroup(StatesGroup):
     waiting_for_group_name = State()
 
-""""
 class CreateTask(StatesGroup):
     waiting_for_group_id = State()
     waiting_for_task_name = State()
     waiting_for_task_description = State()
     waiting_for_task_deadline = State()
-    waiting_for_input_data = State()  # Новый шаг для ввода входных данных
-    waiting_for_expected_result = State()  # Новый шаг для ввода ожидаемого результата
-"""
-
-class CreateTask(StatesGroup):
-    waiting_for_group_id = State()
-    waiting_for_task_name = State()
-    waiting_for_task_description = State()
-    waiting_for_task_deadline = State()  # Добавляем состояние для дедлайна
-    waiting_for_input_data = State()  # Исправлено имя состояния
-    waiting_for_expected_result = State()  # Исправлено имя состояния
-
+    waiting_for_number_of_tests = State()
+    waiting_for_test_method = State()  # Новое состояние для выбора способа ввода тестов
+    waiting_for_input_data = State()
+    waiting_for_input_archive = State()
+    waiting_for_output_data = State()
+    waiting_for_output_archive = State()
+    waiting_for_expected_result = State()
+    waiting_for_test_input = State()
 
 def get_back_button():
     return ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад"))
@@ -140,6 +141,13 @@ def generate_password(length=8):
 def escape_markdown(text: str) -> str:
     # Экранирование символов, которые могут нарушить разметку Markdown
     return re.sub(r'([\\_*[\]()>#+-.!|])', r'\\\1', text)
+
+def get_test_method_keyboard():
+    return ReplyKeyboardMarkup(resize_keyboard=True).add(
+        KeyboardButton("Ввести тесты через клавиатуру"),
+        KeyboardButton("Загрузить тесты через архив"),
+        KeyboardButton("Назад")
+    )
 
 # Команда /start
 @dp.message_handler(commands=['start'], state="*")
@@ -214,6 +222,7 @@ async def save_educational_institution(message: types.Message, state: FSMContext
 
     # Получаем данные о пользователе из состояния
     user_data = await state.get_data()
+    role = user_data.get('role')
 
     # Проверяем, существует ли уже образовательная организация в базе данных
     institution = session.query(EducationalInstitution).filter_by(name=educational_institution_name).first()
@@ -222,33 +231,20 @@ async def save_educational_institution(message: types.Message, state: FSMContext
     if not institution:
         institution = EducationalInstitution(name=educational_institution_name)
         session.add(institution)
-        session.commit()  # Сохраняем образовательную организацию в базе данных
-
-    # Проверяем, существует ли уже пользователь с таким ФИО в той же организации
-    existing_user = session.query(User).filter_by(
-        full_name=user_data.get('full_name'),
-        educational_institution_id=institution.id
-    ).first()
-
-    if existing_user:
-        await message.reply("Ошибка: Пользователь с таким ФИО уже зарегистрирован в этой образовательной организации.")
-        return
+        session.commit()
 
     # Логика для студента
-    role = user_data.get('role')
     if role == "student":
-        # Сохраняем студента в базе данных
         user = User(
             telegram_id=str(message.from_user.id),
             full_name=user_data.get('full_name'),
             role="student",
             region=user_data.get('region'),
             city=user_data.get('city'),
-            educational_institution_id=institution.id,  
+            educational_institution_id=institution.id,
         )
         session.add(user)
-        session.commit()  
-
+        session.commit()
         await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена!")
         await state.finish()
     else:
@@ -256,17 +252,32 @@ async def save_educational_institution(message: types.Message, state: FSMContext
         user = User(
             telegram_id=str(message.from_user.id),
             full_name=user_data.get('full_name'),
-            role="teacher",
+            role="pending_teacher",  # Роль "pending_teacher" — ожидает подтверждения
             region=user_data.get('region'),
             city=user_data.get('city'),
-            educational_institution_id=institution.id,  
+            educational_institution_id=institution.id,
         )
         session.add(user)
         session.commit()
 
-        await message.reply(f"Вы выбрали образовательную организацию: {institution.name}. Регистрация завершена!")
-        await state.finish()
+        # Уведомляем техподдержку о новом запросе
+        support_users = session.query(User).filter_by(role="support").all()
+        for support in support_users:
+            await bot.send_message(
+                support.telegram_id,
+                f"📩 Новый запрос на регистрацию преподавателя:\n"
+                f"👤 Имя: {user.full_name}\n"  # Добавляем имя пользователя
+                f"🏫 Образовательное учреждение: {institution.name}\n"
+                f"🆔 ID: {user.id}\n"
+                f"✅ Подтвердить: /confirm_teacher {user.id}\n"
+                f"❌ Отклонить: /reject_teacher {user.id}"
+            )
 
+        await message.reply(
+            f"Вы выбрали образовательную организацию: {institution.name}. "
+            "Ваша регистрация отправлена на подтверждение техподдержке. Ожидайте ответа."
+        )
+        await state.finish()
 
 # Шаг 3: Обработка выбора преподавателя (для студента)
 @dp.callback_query_handler(lambda c: c.data.startswith("teacher_"), state="waiting_for_teacher")
@@ -368,30 +379,6 @@ async def process_group_name(message: types.Message, state: FSMContext):
     await state.finish()
 
 
-# Обработчик для выбора пароля
-"""
-@dp.message_handler(state="waiting_for_password_choice", content_types=types.ContentTypes.TEXT)
-async def process_password_choice(message: types.Message, state: FSMContext):
-    password_choice = message.text.strip().lower()
-
-    if password_choice not in ["да", "нет"]:
-        await message.reply("Пожалуйста, ответьте 'да' или 'нет'.")
-        return
-
-    group_name = (await state.get_data())["group_name"]
-    
-    if password_choice == "нет":
-        # Если без пароля, создаем группу без пароля
-        new_group = Group(name=group_name, password=None)
-        session.add(new_group)
-        session.commit()
-        await message.reply(f"Группа '{group_name}' успешно создана без пароля.")
-    else:
-        # Если с паролем, просим задать пароль или генерируем его
-        await state.set_state("waiting_for_password")
-        await message.reply(f"Введите пароль для группы '{group_name}' или отправьте 'генерировать' для автоматического пароля.")
-"""
-
 # Обработчик для ввода пароля
 @dp.message_handler(state="waiting_for_password", content_types=types.ContentTypes.TEXT)
 async def process_password(message: types.Message, state: FSMContext):
@@ -475,25 +462,6 @@ async def process_new_password(message: types.Message, state: FSMContext):
     # Завершаем процесс изменения пароля
     await state.finish()
 
-# Обработчик для просмотра паролей (только для преподавателя или администратора)
-"""
-@dp.message_handler(commands=['view_passwords'])
-async def cmd_view_passwords(message: types.Message, state: FSMContext):
-    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
-
-    if not user or user.role not in ["admin", "teacher"]:
-        await message.reply("У вас нет прав для просмотра паролей групп.")
-        return
-
-    # Получаем список групп и их паролей
-    groups = session.query(Group).all()
-    response = "Пароли групп:\n"
-    for group in groups:
-        response += f"Группа: {group.name}, Пароль: {group.password}\n"
-
-    await message.reply(response)
-"""
-
 # Присоединение ученика к группе
 @dp.message_handler(lambda message: not message.text.startswith("Группа: ") and len(message.text) == 8)
 async def join_group(message: types.Message):
@@ -569,58 +537,41 @@ async def set_task_deadline(message: types.Message, state: FSMContext):
     elif message.text == "НЕТ ДЕДЛАЙНА":
         # Устанавливаем дедлайн как None
         await state.update_data(task_deadline=None)
-        await message.reply("Введите входные данные для теста:", reply_markup=get_input_data_keyboard())
-        await CreateTask.waiting_for_input_data.set()  # Переходим к вводу входных данных
+        await message.reply("Выберите способ ввода тестов:", reply_markup=get_test_method_keyboard())
+        await CreateTask.waiting_for_test_method.set()  # Переходим к выбору способа ввода тестов
         return
 
     try:
         # Пытаемся преобразовать введённую строку в формат даты
         deadline = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
         await state.update_data(task_deadline=deadline)
-        await message.reply("Введите входные данные для теста:", reply_markup=get_input_data_keyboard())
-        await CreateTask.waiting_for_input_data.set()  # Переходим к вводу входных данных
+        await message.reply("Выберите способ ввода тестов:", reply_markup=get_test_method_keyboard())
+        await CreateTask.waiting_for_test_method.set()  # Переходим к выбору способа ввода тестов
     except ValueError:
         # Если формат неправильный, отправляем ошибку
         await message.reply("Неверный формат даты. Пожалуйста, введите дедлайн в формате YYYY-MM-DD HH:MM.")
 
-
 @dp.message_handler(state=CreateTask.waiting_for_expected_result, content_types=types.ContentTypes.TEXT)
-async def save_task(message: types.Message, state: FSMContext):
-    if message.text == "Назад":
-        await message.reply("Вы вернулись на шаг ввода входных данных.", reply_markup=get_back_button())
-        await CreateTask.waiting_for_input_data.set()
-        return
+async def set_test_output(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_number = data.get("current_test", 1)
+    number_of_tests = data.get("number_of_tests")
 
-    try:
-        # Получаем все данные из состояния
-        data = await state.get_data()
+    # Сохраняем ожидаемые результаты
+    if "test_outputs" not in data:
+        data["test_outputs"] = []
+    data["test_outputs"].append(message.text)
+    await state.update_data(test_outputs=data["test_outputs"])
 
-        # Проверяем, все ли необходимые данные присутствуют
-        if 'group_id' not in data or 'task_name' not in data or 'task_description' not in data:
-            await message.reply("Не все данные были введены. Пожалуйста, вернитесь и заполните все поля.")
-            return
-
-        # Если входные данные нет, то присваиваем None
-        input_data = data.get('input_data', None)
-        expected_result = message.text.strip()  # Ожидаемый результат — это введённый текст
-
-        task = Task(
-            group_id=data["group_id"],
-            name=data["task_name"],
-            description=data["task_description"],
-            deadline=data["task_deadline"],  # Дедлайн из состояния
-            input_data=input_data,  # Входные данные, если они есть
-            expected_result=expected_result  # Ожидаемый результат
-        )
-
-        session.add(task)
-        session.commit()
-        await message.reply(f"Задание '{task.name}' успешно создано.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад")))
+    # Проверяем, все ли тесты введены
+    if test_number < number_of_tests:
+        await state.update_data(current_test=test_number + 1)
+        await message.reply(f"Введите входные данные для теста {test_number + 1}:")
+        await CreateTask.waiting_for_test_input.set()
+    else:
+        # Все тесты введены, завершаем процесс
+        await message.reply("Все тесты успешно добавлены.")
         await state.finish()
-
-    except ValueError:
-        await message.reply("Произошла ошибка при создании задания.")
-
 
 @dp.message_handler(commands=['help'], state="*")
 async def help_command(message: types.Message, state: FSMContext):
@@ -758,19 +709,30 @@ async def set_task_group(message: types.Message):
 @dp.message_handler(state=CreateTask.waiting_for_input_data, content_types=types.ContentTypes.TEXT)
 async def set_task_input_data(message: types.Message, state: FSMContext):
     if message.text == "Назад":
-        await message.reply("Вы вернулись на шаг ввода дедлайна.", reply_markup=get_back_button())
-        await CreateTask.waiting_for_task_deadline.set()  # Возвращаемся на шаг ввода дедлайна
-        return
-    elif message.text == "Входных данных нет":
-        await state.update_data(input_data=None)  # Если входных данных нет, сохраняем None
-        await message.reply("Введите ожидаемый результат:", reply_markup=get_back_button())
-        await CreateTask.waiting_for_expected_result.set()  # Переходим к вводу ожидаемого результата
+        await message.reply("Вы вернулись на шаг выбора способа ввода тестов.", reply_markup=get_test_method_keyboard())
+        await CreateTask.waiting_for_test_method.set()
         return
 
-    # Если введены входные данные
-    await state.update_data(input_data=message.text.strip())
-    await message.reply("Введите ожидаемый результат:", reply_markup=get_back_button())
-    await CreateTask.waiting_for_expected_result.set()  # Переходим к вводу ожидаемого результата
+    # Получаем данные из состояния
+    data = await state.get_data()
+    number_of_tests = data.get("number_of_tests", 1)
+    current_test = data.get("current_test", 1)
+
+    # Сохраняем входные данные
+    if "input_data" not in data:
+        data["input_data"] = []
+    data["input_data"].append(message.text.strip())
+    await state.update_data(input_data=data["input_data"])
+
+    # Проверяем, все ли тесты введены
+    if current_test < number_of_tests:
+        await state.update_data(current_test=current_test + 1)
+        await message.reply(f"Введите входные данные для теста {current_test + 1}:")
+    else:
+        # Все тесты введены, переходим к вводу ожидаемых результатов
+        await message.reply("Введите ожидаемый результат для теста 1:")
+        await CreateTask.waiting_for_expected_result.set()
+
 
 # Студентские команды
 
@@ -891,14 +853,23 @@ async def process_group_id(message: types.Message, state: FSMContext):
         await message.reply("Пожалуйста, введите корректный ID группы.")
         return
 
-    # Запись в базу данных или другие действия с group_id
+    # Проверяем, существует ли группа с таким ID
+    group = session.query(Group).filter_by(id=int(group_id)).first()
+    if not group:
+        await message.reply("Группа с таким ID не найдена. Пожалуйста, проверьте введенные данные.")
+        return
+
+    # Привязываем пользователя к группе
     user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
-    user.group_id = group_id
-    session.commit()
+    if user:
+        user.group_id = int(group_id)
+        session.commit()
+        await message.reply(f"Вы успешно привязались к группе с ID: {group_id}")
+    else:
+        await message.reply("Ошибка: Не удалось найти пользователя. Попробуйте снова.")
 
-    await message.reply(f"Вы успешно привязались к группе с ID: {group_id}")
+    # Завершаем состояние
     await state.finish()
-
 
 # Обработчик для ввода ID группы
 @dp.message_handler(state="waiting_for_group_id", content_types=types.ContentTypes.TEXT)
@@ -1206,6 +1177,258 @@ async def list_open_requests(message: types.Message):
     )
     
     await message.reply(f"📋 **Открытые запросы:**\n\n{request_list}\n\nВзять запрос: `/take_request <ID>`", parse_mode="Markdown")
+
+@dp.message_handler(commands=['confirm_teacher'])
+async def confirm_teacher(message: types.Message):
+    # Проверяем, что пользователь — техподдержка
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для подтверждения преподавателей.")
+        return
+
+    # Получаем ID преподавателя из команды
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("📌 Использование: `/confirm_teacher <ID преподавателя>`")
+        return
+
+    teacher_id = args[1]
+    teacher = session.query(User).filter_by(id=teacher_id, role="pending_teacher").first()
+
+    if not teacher:
+        await message.reply("❌ Преподаватель с таким ID не найден или уже подтвержден.")
+        return
+
+    # Меняем роль на "teacher"
+    teacher.role = "teacher"
+    session.commit()
+
+    # Уведомляем преподавателя
+    await bot.send_message(teacher.telegram_id, "✅ Ваша регистрация подтверждена! Теперь вы можете создавать группы и задания.")
+
+    # Уведомляем техподдержку
+    await message.reply(f"✅ Преподаватель {teacher.full_name} успешно подтвержден.")
+
+@dp.message_handler(commands=['reject_teacher'])
+async def reject_teacher(message: types.Message):
+    # Проверяем, что пользователь — техподдержка
+    user = session.query(User).filter_by(telegram_id=str(message.from_user.id)).first()
+    if not user or user.role != "support":
+        await message.reply("❌ У вас нет прав для отклонения преподавателей.")
+        return
+
+    # Получаем ID преподавателя из команды
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("📌 Использование: `/reject_teacher <ID преподавателя>`")
+        return
+
+    teacher_id = args[1]
+    teacher = session.query(User).filter_by(id=teacher_id, role="pending_teacher").first()
+
+    if not teacher:
+        await message.reply("❌ Преподаватель с таким ID не найден или уже подтвержден.")
+        return
+
+    # Удаляем пользователя или меняем роль на "student" (в зависимости от логики)
+    session.delete(teacher)
+    session.commit()
+
+    # Уведомляем преподавателя
+    await bot.send_message(teacher.telegram_id, "❌ Ваша регистрация отклонена техподдержкой.")
+
+    # Уведомляем техподдержку
+    await message.reply(f"❌ Преподаватель {teacher.full_name} отклонен.")
+
+@dp.message_handler(state=CreateTask.waiting_for_number_of_tests, content_types=types.ContentTypes.TEXT)
+async def set_number_of_tests(message: types.Message, state: FSMContext):
+    # Обработка команды "Назад"
+    if message.text and message.text.strip().lower() == "назад":
+        await message.reply("Вы вернулись на шаг выбора способа ввода тестов.", reply_markup=get_test_method_keyboard())
+        await CreateTask.waiting_for_test_method.set()
+        return  # Завершаем выполнение функции
+
+    try:
+        number_of_tests = int(message.text.strip())
+        if number_of_tests <= 0:
+            await message.reply("Количество тестов должно быть больше 0.")
+            return
+
+        # Сохраняем количество тестов в состоянии
+        await state.update_data(number_of_tests=number_of_tests, current_test=1)
+
+        # Переходим к вводу входных данных
+        await message.reply(f"Введите входные данные для теста 1:", reply_markup=get_back_button())
+        await CreateTask.waiting_for_input_data.set()
+    except ValueError:
+        await message.reply("Пожалуйста, введите число или используйте кнопку 'Назад'.")
+
+@dp.message_handler(state=CreateTask.waiting_for_test_input, content_types=types.ContentTypes.TEXT)
+async def set_test_input(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_number = data.get("current_test", 1)
+    number_of_tests = data.get("number_of_tests")
+
+    # Проверяем, что number_of_tests не None
+    if number_of_tests is None:
+        await message.reply("Ошибка: количество тестов не указано. Пожалуйста, начните заново.")
+        await state.finish()
+        return
+
+    # Сохраняем входные данные
+    if "test_inputs" not in data:
+        data["test_inputs"] = []
+    data["test_inputs"].append(message.text)
+    await state.update_data(test_inputs=data["test_inputs"])
+
+    # Переходим к вводу ожидаемых результатов
+    await message.reply(f"Введите ожидаемый результат для теста {test_number}:")
+    await CreateTask.waiting_for_expected_result.set()
+
+@dp.message_handler(state=CreateTask.waiting_for_expected_result, content_types=types.ContentTypes.TEXT)
+async def set_test_output(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_number = data.get("current_test", 1)
+    number_of_tests = data.get("number_of_tests")
+
+    # Проверяем, что number_of_tests не None
+    if number_of_tests is None:
+        await message.reply("Ошибка: количество тестов не указано. Пожалуйста, начните заново.")
+        await state.finish()
+        return
+
+    # Сохраняем ожидаемые результаты
+    if "test_outputs" not in data:
+        data["test_outputs"] = []
+    data["test_outputs"].append(message.text)
+    await state.update_data(test_outputs=data["test_outputs"])
+
+    # Проверяем, все ли тесты введены
+    if test_number < number_of_tests:
+        await state.update_data(current_test=test_number + 1)
+        await message.reply(f"Введите входные данные для теста {test_number + 1}:")
+        await CreateTask.waiting_for_test_input.set()
+    else:
+        # Все тесты введены, завершаем процесс
+        await message.reply("Все тесты успешно добавлены.")
+        await state.finish()
+
+@dp.message_handler(state=CreateTask.waiting_for_input_archive, content_types=[types.ContentType.DOCUMENT, types.ContentType.TEXT])
+async def handle_input_archive(message: types.Message, state: FSMContext):
+    # Обработка команды "Назад"
+    if message.text and message.text.strip().lower() == "назад":
+        await message.reply("Вы вернулись на шаг выбора способа ввода тестов.", reply_markup=get_test_method_keyboard())
+        await CreateTask.waiting_for_test_method.set()
+        return  # Завершаем выполнение функции
+
+    # Обработка загрузки архива
+    if message.document:
+        if message.document.mime_type != "application/zip":
+            await message.reply("❌ Ошибка: загрузите архив в формате .zip.")
+            return
+
+        file_id = message.document.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        downloaded_file = await bot.download_file(file_path)
+
+        # Чтение архива с входными данными
+        with zipfile.ZipFile(io.BytesIO(downloaded_file.read())) as archive:
+            input_files = [name for name in archive.namelist() if name.endswith(".txt")]
+            if not input_files:
+                await message.reply("❌ Ошибка: в архиве нет файлов .txt.")
+                return
+
+            # Сохраняем входные данные и количество тестов
+            input_data = []
+            for input_file in input_files:
+                with archive.open(input_file) as file:
+                    content = file.read().decode("utf-8")
+                    input_data.append(content)
+
+            # Количество тестов равно количеству файлов
+            number_of_tests = len(input_files)
+
+            # Сохраняем данные в состоянии
+            await state.update_data(
+                input_data=input_data,
+                number_of_tests=number_of_tests,
+                current_test=1
+            )
+
+        # Переходим к загрузке архива с выходными данными
+        await message.reply("✅ Архив с входными данными успешно загружен. Теперь загрузите архив с выходными данными.")
+        await CreateTask.waiting_for_output_archive.set()
+
+    # Игнорируем любые другие текстовые сообщения, кроме "Назад"
+    elif message.text:
+        await message.reply("Пожалуйста, загрузите архив в формате .zip или используйте кнопку 'Назад'.")
+
+@dp.message_handler(state=CreateTask.waiting_for_output_archive, content_types=types.ContentType.DOCUMENT)
+async def handle_output_archive(message: types.Message, state: FSMContext):
+    if message.document.mime_type != "application/zip":
+        await message.reply("❌ Ошибка: загрузите архив в формате .zip.")
+        return
+
+    file_id = message.document.file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
+    downloaded_file = await bot.download_file(file_path)
+
+    # Чтение архива с выходными данными
+    with zipfile.ZipFile(io.BytesIO(downloaded_file.read())) as archive:
+        output_files = [name for name in archive.namelist() if name.endswith(".txt")]
+        if not output_files:
+            await message.reply("❌ Ошибка: в архиве нет файлов .txt.")
+            return
+
+        # Сохраняем выходные данные
+        output_data = []
+        for output_file in output_files:
+            with archive.open(output_file) as file:
+                content = file.read().decode("utf-8")
+                output_data.append(content)
+
+        await state.update_data(output_data=output_data, output_files_count=len(output_files))
+
+    # Проверяем, что количество файлов совпадает
+    data = await state.get_data()
+    if data.get("input_files_count") != data.get("output_files_count"):
+        await message.reply("❌ Ошибка: количество файлов во входных и выходных данных не совпадает.")
+        return
+
+    # Сохраняем тесты в базе данных
+    task = Task(
+        group_id=data.get("group_id"),
+        name=data.get("task_name"),
+        description=data.get("task_description"),
+        deadline=data.get("task_deadline"),
+        input_data="|".join(data.get("input_data")),  # Сохраняем входные данные как строку с разделителем
+        expected_result="|".join(data.get("output_data"))  # Сохраняем выходные данные как строку с разделителем
+    )
+    session.add(task)
+    session.commit()
+
+    # Завершаем процесс
+    await message.reply("✅ Все тесты успешно загружены и сохранены.")
+    await state.finish()
+
+@dp.message_handler(state=CreateTask.waiting_for_test_method, content_types=types.ContentTypes.TEXT)
+async def set_test_method(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг ввода дедлайна.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_task_deadline.set()
+        return
+    elif message.text == "Ввести тесты через клавиатуру":
+        # Запрашиваем количество тестов
+        await message.reply("Введите количество тестов для задания:")
+        await CreateTask.waiting_for_number_of_tests.set()
+    elif message.text == "Загрузить тесты через архив":
+        # Пропускаем запрос количества тестов и переходим к загрузке архива
+        await message.reply("Загрузите архив с входными данными (формат .zip):", reply_markup=get_back_button())
+        await CreateTask.waiting_for_input_archive.set()
+    else:
+        await message.reply("Пожалуйста, выберите один из предложенных вариантов.")
 
 # Запуск бота
 if __name__ == "__main__":
