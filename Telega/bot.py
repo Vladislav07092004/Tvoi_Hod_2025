@@ -118,6 +118,7 @@ class CreateTask(StatesGroup):
     waiting_for_output_archive = State()
     waiting_for_expected_result = State()
     waiting_for_test_input = State()
+    waiting_for_file_action = State()  # Новое состояние для выбора действия с файлом
 
 def get_back_button():
     return ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Назад"))
@@ -148,6 +149,40 @@ def get_test_method_keyboard():
         KeyboardButton("Загрузить тесты через архив"),
         KeyboardButton("Назад")
     )
+
+def format_teacher_name(full_name):
+    parts = full_name.split()
+    if len(parts) >= 2:
+        # Берем первую букву имени и фамилию
+        first_name = parts[1][0].upper()
+        last_name = parts[0]
+        return f"{first_name}.{last_name}"
+    return "Unknown"
+
+def create_task_directory(educational_institution, teacher_name, group_id, task_id):
+    """
+    Создает структуру папок для хранения файлов задания.
+    Формат: Образовательная организация/Преподаватель/Группа/Задание/
+    """
+    base_dir = "tasks"  # Базовая папка для всех заданий
+    institution_dir = educational_institution.replace(" ", "_")  # Заменяем пробелы на подчеркивания
+    teacher_dir = format_teacher_name(teacher_name)
+    group_dir = f"Group_{group_id}"
+    task_dir = f"Task_{task_id}"
+
+    # Полный путь к папке задания
+    full_path = os.path.join(base_dir, institution_dir, teacher_dir, group_dir, task_dir)
+
+    # Создаем папки, если они не существуют
+    os.makedirs(full_path, exist_ok=True)
+
+    return full_path
+
+def save_file_to_task_directory(task_directory, file_name, file_content):
+    file_path = os.path.join(task_directory, file_name)
+    with open(file_path, "wb") as f:
+        f.write(file_content)
+    return file_path
 
 # Команда /start
 @dp.message_handler(commands=['start'], state="*")
@@ -219,6 +254,9 @@ async def save_region(message: types.Message, state: FSMContext):
 @dp.message_handler(state="waiting_for_educational_institution", content_types=types.ContentTypes.TEXT)
 async def save_educational_institution(message: types.Message, state: FSMContext):
     educational_institution_name = message.text.strip()
+
+    # Сохраняем название образовательного учреждения в состоянии
+    await state.update_data(educational_institution=educational_institution_name)
 
     # Получаем данные о пользователе из состояния
     user_data = await state.get_data()
@@ -1315,54 +1353,79 @@ async def set_test_output(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=CreateTask.waiting_for_input_archive, content_types=[types.ContentType.DOCUMENT, types.ContentType.TEXT])
 async def handle_input_archive(message: types.Message, state: FSMContext):
-    # Обработка команды "Назад"
     if message.text and message.text.strip().lower() == "назад":
         await message.reply("Вы вернулись на шаг выбора способа ввода тестов.", reply_markup=get_test_method_keyboard())
         await CreateTask.waiting_for_test_method.set()
-        return  # Завершаем выполнение функции
+        return
 
-    # Обработка загрузки архива
     if message.document:
-        if message.document.mime_type != "application/zip":
-            await message.reply("❌ Ошибка: загрузите архив в формате .zip.")
-            return
-
         file_id = message.document.file_id
         file = await bot.get_file(file_id)
         file_path = file.file_path
         downloaded_file = await bot.download_file(file_path)
 
-        # Чтение архива с входными данными
-        with zipfile.ZipFile(io.BytesIO(downloaded_file.read())) as archive:
-            input_files = [name for name in archive.namelist() if name.endswith(".txt")]
-            if not input_files:
-                await message.reply("❌ Ошибка: в архиве нет файлов .txt.")
-                return
+        # Сохраняем файл в состоянии
+        await state.update_data(input_file=downloaded_file.read(), input_file_name=message.document.file_name)
 
-            # Сохраняем входные данные и количество тестов
-            input_data = []
-            for input_file in input_files:
-                with archive.open(input_file) as file:
-                    content = file.read().decode("utf-8")
-                    input_data.append(content)
+        # Спрашиваем, что делать с файлом
+        markup = ReplyKeyboardMarkup(resize_keyboard=True).add(
+            KeyboardButton("Считать данные из файла"),
+            KeyboardButton("Сохранить файл на диск"),
+            KeyboardButton("Назад")
+        )
+        await message.reply("Что вы хотите сделать с загруженным файлом?", reply_markup=markup)
+        await CreateTask.waiting_for_file_action.set()
+    else:
+        await message.reply("Пожалуйста, загрузите файл или используйте кнопку 'Назад'.")
 
-            # Количество тестов равно количеству файлов
-            number_of_tests = len(input_files)
+@dp.message_handler(state=CreateTask.waiting_for_file_action, content_types=types.ContentTypes.TEXT)
+async def handle_file_action(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await message.reply("Вы вернулись на шаг загрузки файла.", reply_markup=get_back_button())
+        await CreateTask.waiting_for_input_archive.set()
+        return
 
-            # Сохраняем данные в состоянии
-            await state.update_data(
-                input_data=input_data,
-                number_of_tests=number_of_tests,
-                current_test=1
-            )
+    data = await state.get_data()
+    file_content = data.get("input_file")
+    file_name = data.get("input_file_name")
 
-        # Переходим к загрузке архива с выходными данными
-        await message.reply("✅ Архив с входными данными успешно загружен. Теперь загрузите архив с выходными данными.")
-        await CreateTask.waiting_for_output_archive.set()
+    if message.text == "Считать данные из файла":
+        # Обработка файла и считывание данных
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
+                input_files = [name for name in archive.namelist() if name.endswith(".txt")]
+                if not input_files:
+                    await message.reply("❌ Ошибка: в архиве нет файлов .txt.")
+                    return
 
-    # Игнорируем любые другие текстовые сообщения, кроме "Назад"
-    elif message.text:
-        await message.reply("Пожалуйста, загрузите архив в формате .zip или используйте кнопку 'Назад'.")
+                input_data = []
+                for input_file in input_files:
+                    with archive.open(input_file) as file:
+                        content = file.read().decode("utf-8")
+                        input_data.append(content)
+
+                await state.update_data(input_data=input_data, input_files_count=len(input_files), current_test=1)
+                await message.reply("✅ Данные успешно считаны из файла. Теперь загрузите архив с выходными данными.")
+                await CreateTask.waiting_for_output_archive.set()  # Переход к загрузке выходных данных
+        except Exception as e:
+            await message.reply(f"❌ Ошибка при чтении файла: {e}")
+            await state.finish()
+
+    elif message.text == "Сохранить файл на диск":
+        # Сохранение файла на диск
+        try:
+            with open(file_name, "wb") as f:
+                f.write(file_content)
+            await message.reply(f"✅ Файл успешно сохранен на диск как {file_name}.")
+            
+            # Переход к загрузке выходных данных
+            await message.reply("Теперь загрузите архив с выходными данными.")
+            await CreateTask.waiting_for_output_archive.set()
+        except Exception as e:
+            await message.reply(f"❌ Ошибка при сохранении файла: {e}")
+            await state.finish()
+    else:
+        await message.reply("Пожалуйста, выберите одно из предложенных действий.")
 
 @dp.message_handler(state=CreateTask.waiting_for_output_archive, content_types=types.ContentType.DOCUMENT)
 async def handle_output_archive(message: types.Message, state: FSMContext):
@@ -1375,36 +1438,38 @@ async def handle_output_archive(message: types.Message, state: FSMContext):
     file_path = file.file_path
     downloaded_file = await bot.download_file(file_path)
 
-    # Чтение архива с выходными данными
-    with zipfile.ZipFile(io.BytesIO(downloaded_file.read())) as archive:
-        output_files = [name for name in archive.namelist() if name.endswith(".txt")]
-        if not output_files:
-            await message.reply("❌ Ошибка: в архиве нет файлов .txt.")
-            return
-
-        # Сохраняем выходные данные
-        output_data = []
-        for output_file in output_files:
-            with archive.open(output_file) as file:
-                content = file.read().decode("utf-8")
-                output_data.append(content)
-
-        await state.update_data(output_data=output_data, output_files_count=len(output_files))
-
-    # Проверяем, что количество файлов совпадает
+    # Получаем данные из состояния
     data = await state.get_data()
-    if data.get("input_files_count") != data.get("output_files_count"):
-        await message.reply("❌ Ошибка: количество файлов во входных и выходных данных не совпадает.")
+    educational_institution = data.get("educational_institution")  # Название образовательной организации
+    teacher_name = data.get("teacher_name")  # Имя преподавателя
+    group_id = data.get("group_id")  # ID группы
+    task_id = data.get("task_id")  # ID задания
+
+    # Проверяем, что educational_institution не None
+    if educational_institution is None:
+        await message.reply("❌ Ошибка: не указано образовательное учреждение.")
+        await state.finish()
         return
+
+    # Создаем структуру папок
+    task_directory = create_task_directory(educational_institution, teacher_name, group_id, task_id)
+
+    # Сохраняем входные данные
+    input_archive_path = save_file_to_task_directory(task_directory, "input.zip", data.get("input_file"))
+    await message.reply(f"✅ Входные данные сохранены в: {input_archive_path}")
+
+    # Сохраняем выходные данные
+    output_archive_path = save_file_to_task_directory(task_directory, "output.zip", downloaded_file.read())
+    await message.reply(f"✅ Выходные данные сохранены в: {output_archive_path}")
 
     # Сохраняем тесты в базе данных
     task = Task(
-        group_id=data.get("group_id"),
+        group_id=group_id,
         name=data.get("task_name"),
         description=data.get("task_description"),
         deadline=data.get("task_deadline"),
-        input_data="|".join(data.get("input_data")),  # Сохраняем входные данные как строку с разделителем
-        expected_result="|".join(data.get("output_data"))  # Сохраняем выходные данные как строку с разделителем
+        input_data=input_archive_path,  # Сохраняем путь к входным данным
+        expected_result=output_archive_path  # Сохраняем путь к выходным данным
     )
     session.add(task)
     session.commit()
@@ -1429,6 +1494,8 @@ async def set_test_method(message: types.Message, state: FSMContext):
         await CreateTask.waiting_for_input_archive.set()
     else:
         await message.reply("Пожалуйста, выберите один из предложенных вариантов.")
+
+
 
 # Запуск бота
 if __name__ == "__main__":
