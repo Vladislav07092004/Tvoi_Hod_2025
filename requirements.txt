@@ -1,2 +1,2 @@
-aiogram==2.25.1
-sqlalchemy
+aiogram==2.23.1
+sqlalchemy==2.0.13
